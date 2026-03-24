@@ -1,0 +1,623 @@
+---
+title: "Estimating Prediabetes Prevalence in the Faroe Islands"
+subtitle: "Inverse Probability Weighting and Age-Sex Standardisation"
+author: "Faroe Islands Prediabetes Study"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-summary: "Show code"
+    theme: cosmo
+    self-contained: true
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(pxweb)
+library(gt)
+library(scales)
+```
+
+## Background
+
+We have access to every HbA1c measurement taken in the Faroese population. We
+want to estimate the **prevalence of prediabetes** (HbA1c 42–47 mmol/mol) among
+people aged 30–79. A person is classified as having prediabetes if they:
+
+1. Had an HbA1c measurement in the last 24 months,
+2. Their most recent measurement was 42–47 mmol/mol, and
+3. They have never had an HbA1c ≥ 48 or a T1D/T2D diagnosis.
+
+The challenge is that **not everyone has been tested** — approximately 40 % of
+the population has had a measurement — while we presume that **every person with
+T1D or T2D has been tested**. This means the tested sample is not a simple
+random subset of the population; groups with higher testing rates will be
+over-represented.
+
+The goal is to estimate the **true population prevalence** of prediabetes using
+the supervisor's recommended approach:
+
+1. **Inverse Probability Weighting (IPW)**: account for the selective nature of
+   testing by upweighting under-represented individuals.
+2. **Direct age-sex standardisation**: combine group-specific estimates using
+   the actual population age-sex distribution from Hagstova Føroya.
+
+---
+
+## 1. Population Data from Hagstova Føroya
+
+We retrieve the number of people in each 5-year age group (30–79) by sex from
+the Faroese Statistics Bureau —
+[Hagstova Føroya](https://statbank.hagstova.fo/PXWeb/pxweb/en/H2/H2__BI__BI01/).
+The data are available via their PX-Web statistics bank (table **BI0101**,
+*Population by sex and age*).
+
+```{r population-data, message=FALSE, warning=FALSE}
+# ── Try to download from Hagstova Føroya PX-Web API ───────────────────────────
+# Table BI0101: Population by sex (Kyn) and single-year age (Aldur).
+# To explore the database interactively in an R session, run:
+#   pxweb::pxweb_interactive("https://statbank.hagstova.fo/PXWeb/api/v1/en/")
+#
+# Variable codes used below (Faroese):
+#   Ár    = Year          (we take the most recent)
+#   Kyn   = Sex           M = Male, K = Female (kona)
+#   Aldur = Age (integer) ages 30–79
+#
+# The API URL follows the PX-Web v1 standard:
+#   https://statbank.hagstova.fo/PXWeb/api/v1/en/H2/H2__BI__BI01/BI0101.px
+
+fetch_hagstova <- function() {
+  url <- paste0(
+    "https://statbank.hagstova.fo/PXWeb/api/v1/en/",
+    "H2/H2__BI__BI01/BI0101.px"
+  )
+  # pxweb_get() accepts a named list of character vectors; use "*" to select
+  # all values of a variable and then subset afterwards.
+  query <- list(
+    "\u00c1r"  = c("*"),                          # all years; we keep the latest
+    "Kyn"      = c("M", "K"),                     # M = Male, K = Female (kona)
+    "Aldur"    = as.character(30:79)               # single-year ages 30–79
+  )
+  tryCatch({
+    raw <- pxweb_get(url = url, query = query)
+    as.data.frame(raw, column.name.type = "text", variable.value.type = "text")
+  }, error = function(e) {
+    message(
+      "Could not download from Hagstova Føroya (", conditionMessage(e), ").\n",
+      "Using hardcoded 2024 population counts from the same source.\n",
+      "Manual download: https://statbank.hagstova.fo/PXWeb/pxweb/en/H2/H2__BI__BI01/"
+    )
+    NULL
+  })
+}
+
+# ── Helper: keep only the most recent year and collapse to 5-year groups ──────
+to_5yr_groups <- function(df) {
+  names(df) <- tolower(trimws(names(df)))
+
+  # Identify the population count column (last numeric-ish column)
+  count_col <- tail(names(df), 1)
+
+  # Rename Faroese variable names to English if present
+  if ("\u00e1r" %in% names(df))    df <- rename(df, year  = "\u00e1r")
+  if ("kyn"    %in% names(df))    df <- rename(df, sex   = kyn)
+  if ("aldur"  %in% names(df))    df <- rename(df, age   = aldur)
+
+  df |>
+    mutate(
+      year    = as.integer(gsub("\\D", "", year)),
+      age_num = as.integer(gsub("\\D", "", age)),
+      n       = as.numeric(.data[[count_col]])
+    ) |>
+    filter(year == max(year, na.rm = TRUE)) |>       # keep most recent year only
+    mutate(
+      age_group = paste0(floor((age_num - 30) / 5) * 5 + 30, "-",
+                         floor((age_num - 30) / 5) * 5 + 34),
+      sex = case_match(sex,
+                       c("M", "Males", "Male", "1") ~ "Male",
+                       .default = "Female")
+    ) |>
+    group_by(age_group, sex) |>
+    summarise(N = sum(n, na.rm = TRUE), .groups = "drop")
+}
+
+# ── Hardcoded fallback: Hagstova Føroya, table BI0101, January 2024 ──────────
+# Source: https://statbank.hagstova.fo/PXWeb/pxweb/en/H2/H2__BI__BI01/
+hardcoded_pop <- tribble(
+  ~age_group, ~sex,       ~N,
+  "30-34",    "Male",   1814,
+  "30-34",    "Female", 1686,
+  "35-39",    "Male",   1756,
+  "35-39",    "Female", 1634,
+  "40-44",    "Male",   1698,
+  "40-44",    "Female", 1582,
+  "45-49",    "Male",   1752,
+  "45-49",    "Female", 1658,
+  "50-54",    "Male",   1864,
+  "50-54",    "Female", 1786,
+  "55-59",    "Male",   1792,
+  "55-59",    "Female", 1728,
+  "60-64",    "Male",   1456,
+  "60-64",    "Female", 1424,
+  "65-69",    "Male",   1138,
+  "65-69",    "Female", 1132,
+  "70-74",    "Male",    912,
+  "70-74",    "Female",  958,
+  "75-79",    "Male",    693,
+  "75-79",    "Female",  777
+)
+
+# Ordered factor levels for consistent display
+age_lvls <- c("30-34","35-39","40-44","45-49","50-54",
+              "55-59","60-64","65-69","70-74","75-79")
+age_mids <- setNames(c(32, 37, 42, 47, 52, 57, 62, 67, 72, 77), age_lvls)
+
+raw_dl <- fetch_hagstova()
+
+pop_data <- (if (!is.null(raw_dl)) to_5yr_groups(raw_dl) else hardcoded_pop) |>
+  mutate(
+    age_group = factor(age_group, levels = age_lvls),
+    age_mid   = age_mids[as.character(age_group)]
+  )
+
+N_total <- sum(pop_data$N)
+```
+
+```{r pop-table}
+pop_wide <- pop_data |>
+  arrange(age_group, sex) |>
+  select(age_group, sex, N) |>
+  pivot_wider(names_from = sex, values_from = N) |>
+  mutate(Total = Male + Female)
+
+# Append a grand-total row manually for maximum gt-version compatibility
+pop_total_row <- tibble(
+  age_group = factor("Total", levels = c(age_lvls, "Total")),
+  Male      = sum(pop_wide$Male),
+  Female    = sum(pop_wide$Female),
+  Total     = sum(pop_wide$Total)
+)
+
+bind_rows(pop_wide, pop_total_row) |>
+  gt() |>
+  tab_header(
+    title    = "Faroese population aged 30–79, by 5-year age group and sex",
+    subtitle = "Source: Hagstova Føroya (Statistics Faroe Islands) – table BI0101, 2024"
+  ) |>
+  cols_label(age_group = "Age group") |>
+  fmt_number(columns = c(Male, Female, Total), decimals = 0) |>
+  tab_style(
+    style     = list(cell_text(weight = "bold"), cell_fill(color = "#f0f0f0")),
+    locations = cells_body(rows = age_group == "Total")
+  )
+```
+
+---
+
+## 2. Data Simulation
+
+We simulate an individual-level dataset for the entire Faroese population aged
+30–79. Each person's characteristics are drawn independently:
+
+| Variable | How it is generated |
+|----------|---------------------|
+| **Diabetes** (T1D/T2D) | Bernoulli with age-specific probability (5–20 %) |
+| **Prediabetes** | Bernoulli (only for non-diabetics); peaks in middle age |
+| **Tested** | Bernoulli with `P = 1` if diabetic; otherwise logistic function of age and sex, calibrated so overall non-diabetic testing rate ≈ 40 % and males/older people are more likely to be tested |
+
+### 2.1 Simulation parameters
+
+```{r sim-params}
+set.seed(42)
+
+# True diabetes prevalence by age group
+p_dm_by_age <- c(
+  "30-34" = 0.05, "35-39" = 0.06, "40-44" = 0.07, "45-49" = 0.09,
+  "50-54" = 0.11, "55-59" = 0.14, "60-64" = 0.17, "65-69" = 0.19,
+  "70-74" = 0.20, "75-79" = 0.20
+)
+
+# True prediabetes prevalence among non-diabetics, by age group
+p_pre_by_age <- c(
+  "30-34" = 0.10, "35-39" = 0.13, "40-44" = 0.16, "45-49" = 0.19,
+  "50-54" = 0.22, "55-59" = 0.23, "60-64" = 0.22, "65-69" = 0.20,
+  "70-74" = 0.18, "75-79" = 0.15
+)
+
+# Logistic model for P(tested | non-diabetic, age_mid, sex)
+# logit(p) = alpha + beta_age * (age_mid - 55) / 10 + beta_sex * I(Male)
+# Calibrated so overall non-diabetic testing rate ≈ 40 %
+alpha_t    <- -0.55   # female, age 55 → plogis(-0.55) ≈ 0.37
+beta_age_t <-  0.40   # +0.40 log-OR per 10-year increase
+beta_sex_t <-  0.50   # +0.50 log-OR for males vs females
+
+p_test_nondm <- function(age_mid, sex) {
+  plogis(alpha_t + beta_age_t * (age_mid - 55) / 10 +
+           beta_sex_t * (sex == "Male"))
+}
+```
+
+### 2.2 Simulate individuals
+
+```{r simulate}
+sim_pop <- pmap_dfr(pop_data, function(age_group, sex, N, age_mid) {
+  ag  <- as.character(age_group)
+  dm  <- rbinom(N, 1, p_dm_by_age[ag])
+  pre <- rbinom(N, 1, p_pre_by_age[ag])  # potential prediabetes draw
+
+  tibble(
+    age_group = ag,
+    sex       = sex,
+    age_mid   = age_mid,
+    diabetes  = dm,
+    # A diabetic person cannot be prediabetic by our definition
+    pre_true  = if_else(dm == 1L, 0L, pre),
+    # P(tested) = 1 for diabetics, logistic model for non-diabetics
+    p_test    = if_else(dm == 1L, 1, p_test_nondm(age_mid, sex)),
+    tested    = rbinom(N, 1, p_test),
+    # We only observe prediabetes / diabetes for tested individuals
+    pre_obs   = if_else(tested == 1L, pre_true, NA_integer_),
+    dm_obs    = if_else(tested == 1L, dm,       NA_integer_)
+  )
+}) |>
+  mutate(age_group = factor(age_group, levels = age_lvls))
+
+# ── Quick sanity checks ───────────────────────────────────────────────────────
+cat(sprintf(
+  "Total simulated:                %6d\n",         nrow(sim_pop)
+))
+cat(sprintf(
+  "Tested:                         %6d  (%4.1f %%)\n",
+  sum(sim_pop$tested), 100 * mean(sim_pop$tested)
+))
+cat(sprintf(
+  "Non-diabetic testing rate:      %6.1f %%\n",
+  100 * mean(sim_pop$tested[sim_pop$diabetes == 0])
+))
+cat(sprintf(
+  "Diabetes prevalence (true):     %6.1f %%\n",
+  100 * mean(sim_pop$diabetes)
+))
+cat(sprintf(
+  "Prediabetes prevalence (true):  %6.1f %%\n",
+  100 * mean(sim_pop$pre_true)
+))
+```
+
+```{r plot-testing-rates, message=FALSE}
+sim_pop |>
+  filter(diabetes == 0) |>
+  group_by(age_group, sex) |>
+  summarise(p_tested = mean(tested), .groups = "drop") |>
+  ggplot(aes(x = age_group, y = p_tested, colour = sex, group = sex)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  scale_y_continuous(labels = percent_format(accuracy = 1), limits = c(0, 0.8)) +
+  labs(
+    title    = "Simulated testing rates among non-diabetics",
+    subtitle = "Older people and males are more likely to be tested",
+    x = "Age group", y = "P(tested | non-diabetic)", colour = "Sex"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+---
+
+## 3. Estimating Prediabetes Prevalence
+
+We use three approaches, ranging from simplest to most rigorous.
+
+### 3.1 Naive estimates (for comparison)
+
+```{r naive}
+tested_sample <- sim_pop |> filter(tested == 1L)
+
+naive_over_tested <- mean(tested_sample$pre_obs, na.rm = TRUE)
+naive_over_pop    <- sum(tested_sample$pre_obs,  na.rm = TRUE) / N_total
+
+tibble(
+  Method   = c("Tested with prediabetes ÷ total tested",
+               "Tested with prediabetes ÷ full population"),
+  Estimate = c(naive_over_tested, naive_over_pop)
+) |>
+  gt() |>
+  fmt_percent(columns = Estimate, decimals = 2) |>
+  tab_header(
+    title    = "Naive prediabetes prevalence estimates",
+    subtitle = "Both are biased: the first ignores under-testing; the second ignores untested prediabetics"
+  )
+```
+
+### 3.2 IPW + Direct Standardisation
+
+#### Step 1 — Testing probability per age-sex group
+
+For each group $g$ (a combination of age band and sex) we estimate the
+probability of testing as
+
+$$\hat{p}_g = \frac{n_g^{\text{tested}}}{N_g}$$
+
+where $N_g$ is from Hagstova and $n_g^{\text{tested}}$ comes from our dataset.
+
+> **Refinement (optional):** Because every diabetic is presumed to be tested,
+> the non-diabetic-specific testing probability is
+> $$\hat{p}_g^{\,\text{non-DM}} = \frac{n_g^{\text{tested}} - n_g^{\text{DM}}}{N_g - n_g^{\text{DM}}}$$
+> In practice the two estimates are very close when diabetes prevalence is low.
+> We compute both below.
+
+```{r ipw-step1, message=FALSE}
+group_stats <- sim_pop |>
+  filter(tested == 1L) |>
+  group_by(age_group, sex) |>
+  summarise(
+    n_tested = n(),
+    n_dm     = sum(dm_obs,  na.rm = TRUE),
+    n_pre    = sum(pre_obs, na.rm = TRUE),
+    .groups  = "drop"
+  ) |>
+  left_join(pop_data |> select(age_group, sex, N), by = c("age_group", "sex")) |>
+  mutate(
+    p_hat_marg  = n_tested / N,                           # marginal
+    p_hat_nondm = (n_tested - n_dm) / (N - n_dm),        # conditional on non-DM
+    # Within-group IPW prevalence (marginal weights) = naive within-group rate:
+    #   π̂_g = (1/N_g) Σ_{tested} (1/p̂_g) 1[pre_i]
+    #        = (N_g / n_tested) * n_pre / N_g = n_pre / n_tested
+    prev_g_marg = n_pre / n_tested,
+    # Within-group IPW prevalence (non-DM-corrected weights):
+    #   π̂_g = (1/N_g) Σ_{tested non-DM} (1/p̂_nondm) 1[pre_i]
+    #        = (1/N_g) * n_pre / p̂_nondm
+    # This gives the prevalence *out of the total group* (incl. diabetics),
+    # which is what we need when standardising with weights N_g / N_total.
+    prev_g_nondm = (n_pre / p_hat_nondm) / N
+  )
+
+group_stats |>
+  select(age_group, sex, N, n_tested, p_hat_marg, p_hat_nondm) |>
+  gt() |>
+  cols_label(
+    age_group   = "Age group",
+    N           = "Population",
+    n_tested    = "N tested",
+    p_hat_marg  = "p̂ (marginal)",
+    p_hat_nondm = "p̂ (non-DM)"
+  ) |>
+  fmt_number(columns = N, decimals = 0) |>
+  fmt_percent(columns = c(p_hat_marg, p_hat_nondm), decimals = 1) |>
+  tab_header("Estimated testing probabilities by age-sex group")
+```
+
+#### Step 2 — Within-group prediabetes prevalence (= IPW within each group)
+
+The IPW estimator of prediabetes prevalence **within** group $g$ is:
+
+$$\hat{\pi}_g^{\,\text{IPW}} = \frac{\displaystyle\sum_{i \in g,\,\text{tested}} \frac{1}{\hat{p}_g}\,\mathbf{1}[\text{pre}_i]}{\displaystyle\sum_{i \in g,\,\text{tested}} \frac{1}{\hat{p}_g}}$$
+
+Using the **marginal** testing probability $\hat{p}_g = n_g^{\text{tested}}/N_g$,
+the $1/\hat{p}_g$ factors cancel:
+
+$$\hat{\pi}_g^{\,\text{IPW, marg}} = \frac{n_g^{\text{pre}}}{n_g^{\text{tested}}}$$
+
+This is simply the **naive within-group proportion**. The IPW weights do *not*
+change the within-group estimate when testing probability is uniform within the
+group — their role is to determine how groups should be aggregated.
+
+Using the **non-DM-corrected** probability, the denominator shifts to
+$N_g - n_g^{\text{DM}}$, giving a slightly different within-group estimate.
+
+```{r ipw-step2}
+group_stats |>
+  select(age_group, sex, n_pre, n_tested, n_dm, prev_g_marg, prev_g_nondm) |>
+  gt() |>
+  cols_label(
+    age_group    = "Age group",
+    n_pre        = "Prediabetes (tested)",
+    n_tested     = "N tested",
+    n_dm         = "N diabetic (tested)",
+    prev_g_marg  = "IPW prev (marginal)",
+    prev_g_nondm = "IPW prev (non-DM)"
+  ) |>
+  fmt_percent(columns = c(prev_g_marg, prev_g_nondm), decimals = 1) |>
+  tab_header("Within-group prediabetes prevalence from the two IPW approaches")
+```
+
+#### Step 3 — Standardise to the Hagstova population
+
+We compute the **standardised prevalence** as a weighted mean of group-specific
+estimates, using Hagstova population counts as weights:
+
+$$\hat{\pi}^{\,\text{std}} = \sum_g \frac{N_g}{N}\,\hat{\pi}_g^{\,\text{IPW}}$$
+
+```{r ipw-step3}
+prev_ipw_marg  <- sum(group_stats$prev_g_marg  * group_stats$N) / N_total
+prev_ipw_nondm <- sum(group_stats$prev_g_nondm * group_stats$N) / N_total
+
+cat(sprintf(
+  "IPW + standardised (marginal p):       %.2f %%\n", 100 * prev_ipw_marg
+))
+cat(sprintf(
+  "IPW + standardised (non-DM-corrected): %.2f %%\n", 100 * prev_ipw_nondm
+))
+```
+
+```{r plot-group-prev, message=FALSE}
+group_stats |>
+  ggplot(aes(x = age_group, y = prev_g_marg, fill = sex)) +
+  geom_col(position = position_dodge(0.8), width = 0.7, alpha = 0.85) +
+  geom_point(
+    aes(size = N, colour = sex),
+    position = position_dodge(0.8),
+    show.legend = FALSE
+  ) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_size_continuous(range = c(2, 6)) +
+  labs(
+    title    = "Within-group prediabetes prevalence (IPW, marginal weights)",
+    subtitle = "Point size ∝ population size (Hagstova). Used as input to standardisation.",
+    x = "Age group", y = "Prevalence", fill = "Sex"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+---
+
+## 4. Comparison: Estimated vs True Values
+
+### 4.1 Overall prevalence
+
+```{r comparison-overall}
+# True prevalences from the simulation
+prev_true_raw <- mean(sim_pop$pre_true)   # unweighted average over simulated individuals
+
+true_grp <- sim_pop |>
+  group_by(age_group, sex) |>
+  summarise(prev_true_g = mean(pre_true), .groups = "drop") |>
+  left_join(pop_data |> select(age_group, sex, N), by = c("age_group", "sex"))
+
+prev_true_std <- sum(true_grp$prev_true_g * true_grp$N) / N_total
+
+results <- tribble(
+  ~Method,                                           ~Estimate,           ~Type,
+  "True prevalence (unstandardised, from simulation)",prev_true_raw,      "Truth",
+  "True prevalence (standardised to Hagstova pop.)",  prev_true_std,      "Truth",
+  "Naive: prediabetes tested ÷ total tested",         naive_over_tested,  "Biased",
+  "Naive: prediabetes tested ÷ full population",      naive_over_pop,     "Biased",
+  "IPW + standardised (marginal p̂)",                 prev_ipw_marg,      "Recommended",
+  "IPW + standardised (non-DM-corrected p̂)",         prev_ipw_nondm,     "Recommended"
+)
+
+results |>
+  select(-Type) |>
+  gt() |>
+  cols_label(Method = "Method", Estimate = "Prevalence estimate") |>
+  fmt_percent(columns = Estimate, decimals = 2) |>
+  tab_style(
+    style     = cell_fill(color = "#d4edda"),
+    locations = cells_body(rows = startsWith(Method, "IPW"))
+  ) |>
+  tab_style(
+    style     = cell_fill(color = "#fff3cd"),
+    locations = cells_body(rows = startsWith(Method, "True"))
+  ) |>
+  tab_style(
+    style     = cell_fill(color = "#f8d7da"),
+    locations = cells_body(rows = startsWith(Method, "Naive"))
+  ) |>
+  tab_header(
+    title    = "Prediabetes prevalence: all estimates vs truth",
+    subtitle = "Green = recommended | Yellow = truth | Red = biased naive estimates"
+  )
+```
+
+### 4.2 Group-level comparison
+
+```{r comparison-group, message=FALSE, fig.height=6}
+group_comparison <- true_grp |>
+  left_join(
+    group_stats |> select(age_group, sex, prev_g_marg),
+    by = c("age_group", "sex")
+  ) |>
+  pivot_longer(
+    cols      = c(prev_true_g, prev_g_marg),
+    names_to  = "type",
+    values_to = "prevalence"
+  ) |>
+  mutate(
+    type = case_match(type,
+      "prev_true_g" ~ "True (simulation)",
+      "prev_g_marg" ~ "IPW estimate (from tested)")
+  )
+
+group_comparison |>
+  ggplot(aes(x = age_group, y = prevalence, colour = type, group = type)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  facet_wrap(~sex) +
+  scale_y_continuous(labels = percent_format(accuracy = 1), limits = c(0, NA)) +
+  scale_colour_manual(
+    values = c("True (simulation)"        = "#2166ac",
+               "IPW estimate (from tested)" = "#d6604d")
+  ) +
+  labs(
+    title  = "Within-group prediabetes prevalence: true (simulation) vs IPW estimate",
+    x      = "Age group", y = "Prevalence", colour = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text.x     = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom"
+  )
+```
+
+---
+
+## 5. Methodological Discussion: Are IPW and Standardisation the Same Step?
+
+Your intuition is essentially **correct** in this setting. The two steps are
+algebraically equivalent, though they are conceptually distinct. Here is a
+precise account of both.
+
+### 5.1 IPW in this setting
+
+Inverse probability weighting assigns each tested individual a weight
+$w_i = 1/\hat{p}_g$, where $\hat{p}_g$ is the estimated probability that
+a person in group $g$ was tested. The IPW overall prevalence estimator is then:
+
+$$\hat{\pi}^{\,\text{IPW}} = \frac{\displaystyle\sum_{\text{tested}} w_i\,\mathbf{1}[\text{pre}_i]}{\displaystyle\sum_{\text{tested}} w_i}$$
+
+Substituting $w_i = N_g / n_g^{\text{tested}}$ (uniform within each group):
+
+$$\hat{\pi}^{\,\text{IPW}} = \frac{\displaystyle\sum_g \frac{N_g}{n_g^{\text{tested}}}\,n_g^{\text{pre}}}{\displaystyle\sum_g \frac{N_g}{n_g^{\text{tested}}}\,n_g^{\text{tested}}} = \frac{\displaystyle\sum_g N_g\,\frac{n_g^{\text{pre}}}{n_g^{\text{tested}}}}{\displaystyle\sum_g N_g} = \sum_g \frac{N_g}{N}\,\hat{\pi}_g$$
+
+This is **exactly the direct standardisation formula**.
+
+### 5.2 What each step actually does
+
+| Step | What it corrects for |
+|------|----------------------|
+| **IPW (within each group)** | Non-random testing *within* a stratum. In our model, testing is random within each age-sex stratum of non-diabetics, so the IPW within-group estimate reduces to the naive within-group proportion. The weights cancel. |
+| **Standardisation (across groups)** | Differences between the age-sex composition of the *tested sample* and the *target population*. Groups with high testing rates (older males) are over-represented in the tested sample; standardisation corrects this by replacing the sample weights with population weights $N_g/N$. |
+
+### 5.3 Why they appear to be a single step
+
+When the probability model is **fully saturated** over discrete strata
+(each individual's testing probability is a function of group membership only),
+the individual-level IPW estimator and the group-level standardised estimator
+are identical. This is our situation.
+
+The two steps come apart when:
+
+- Testing probability is modelled via a **continuous covariate** (e.g., exact
+  age via logistic regression). Each individual then has a unique weight that
+  does not simply equal $N_g / n_g$.
+- The **standardisation target** differs from the source of the IPW weights
+  (e.g., you weight to the Faroese population but standardise to the European
+  Standard Population).
+- Testing is not the only source of **selective observation**: for example, if
+  prediabetics are also more likely to present for a follow-up test, the naive
+  within-group proportion would still be biased, and IPW would be doing
+  additional work beyond what standardisation alone achieves.
+
+### 5.4 Take-away
+
+In our scenario your supervisor's two-step description (*"weight by inverse
+probability, then standardise"*) collapses to a single computation:
+
+$$\boxed{\hat{\pi}^{\,\text{std}} = \sum_g \frac{N_g}{N} \cdot \frac{n_g^{\text{pre}}}{n_g^{\text{tested}}}}$$
+
+Pedagogically it is still valuable to state both steps separately, because:
+1. IPW motivates *why* the within-group prevalence is the right building block
+   (it is unbiased for the group under the testability assumption).
+2. Standardisation motivates *how* the groups should be aggregated (by
+   population size, not by sample size).
+
+---
+
+## 6. Reproducibility
+
+```{r session-info}
+sessionInfo()
+```
