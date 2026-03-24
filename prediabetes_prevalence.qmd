@@ -18,6 +18,7 @@ library(tidyverse)
 library(pxweb)
 library(gt)
 library(scales)
+library(wesanderson)
 ```
 
 ## Background
@@ -127,26 +128,26 @@ to_5yr_groups <- function(df) {
 # Source: https://statbank.hagstova.fo/PXWeb/pxweb/en/H2/H2__BI__BI01/
 hardcoded_pop <- tribble(
   ~age_group, ~sex,       ~N,
-  "30-34",    "Male",   1814,
-  "30-34",    "Female", 1686,
-  "35-39",    "Male",   1756,
-  "35-39",    "Female", 1634,
-  "40-44",    "Male",   1698,
-  "40-44",    "Female", 1582,
-  "45-49",    "Male",   1752,
-  "45-49",    "Female", 1658,
-  "50-54",    "Male",   1864,
-  "50-54",    "Female", 1786,
-  "55-59",    "Male",   1792,
-  "55-59",    "Female", 1728,
-  "60-64",    "Male",   1456,
-  "60-64",    "Female", 1424,
-  "65-69",    "Male",   1138,
-  "65-69",    "Female", 1132,
-  "70-74",    "Male",    912,
-  "70-74",    "Female",  958,
-  "75-79",    "Male",    693,
-  "75-79",    "Female",  777
+  "30-34",    "Male",   1788,
+  "30-34",    "Female", 1651,
+  "35-39",    "Male",   2047,
+  "35-39",    "Female", 1800,
+  "40-44",    "Male",   1774,
+  "40-44",    "Female", 1531,
+  "45-49",    "Male",   1779,
+  "45-49",    "Female", 1558,
+  "50-54",    "Male",   1824,
+  "50-54",    "Female", 1542,
+  "55-59",    "Male",   1802,
+  "55-59",    "Female", 1636,
+  "60-64",    "Male",   1686,
+  "60-64",    "Female", 1568,
+  "65-69",    "Male",   1435,
+  "65-69",    "Female", 1452,
+  "70-74",    "Male",    1285,
+  "70-74",    "Female",  1244,
+  "75-79",    "Male",    1087,
+  "75-79",    "Female",  1091
 )
 
 # Ordered factor levels for consistent display
@@ -459,7 +460,9 @@ group_stats |>
     x = "Age group", y = "Prevalence", fill = "Sex"
   ) +
   theme_minimal(base_size = 13) +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_manual(values = wes_palette("FantasticFox1")[c(1,3)]) +
+  scale_color_manual(values = wes_palette("FantasticFox1")[c(1,3)])
 ```
 
 ---
@@ -495,15 +498,15 @@ results |>
   cols_label(Method = "Method", Estimate = "Prevalence estimate") |>
   fmt_percent(columns = Estimate, decimals = 2) |>
   tab_style(
-    style     = cell_fill(color = "#d4edda"),
+    style     = cell_fill(color = wes_palette("FantasticFox1")[1]),
     locations = cells_body(rows = startsWith(Method, "IPW"))
   ) |>
   tab_style(
-    style     = cell_fill(color = "#fff3cd"),
+    style     = cell_fill(color = wes_palette("FantasticFox1")[2]),
     locations = cells_body(rows = startsWith(Method, "True"))
   ) |>
   tab_style(
-    style     = cell_fill(color = "#f8d7da"),
+    style     = cell_fill(color = wes_palette("FantasticFox1")[3]),
     locations = cells_body(rows = startsWith(Method, "Naive"))
   ) |>
   tab_header(
@@ -517,18 +520,19 @@ results |>
 ```{r comparison-group, message=FALSE, fig.height=6}
 group_comparison <- true_grp |>
   left_join(
-    group_stats |> select(age_group, sex, prev_g_marg),
+    group_stats |> select(age_group, sex, prev_g_marg, prev_g_nondm),
     by = c("age_group", "sex")
   ) |>
   pivot_longer(
-    cols      = c(prev_true_g, prev_g_marg),
+    cols      = c(prev_true_g, prev_g_marg, prev_g_nondm),
     names_to  = "type",
     values_to = "prevalence"
   ) |>
   mutate(
     type = case_match(type,
       "prev_true_g" ~ "True (simulation)",
-      "prev_g_marg" ~ "IPW estimate (from tested)")
+      "prev_g_marg" ~ "IPW estimate (from tested)",
+      "prev_g_nondm" ~ "IPW estimate (non-DM-corrected)")
   )
 
 group_comparison |>
@@ -538,8 +542,7 @@ group_comparison |>
   facet_wrap(~sex) +
   scale_y_continuous(labels = percent_format(accuracy = 1), limits = c(0, NA)) +
   scale_colour_manual(
-    values = c("True (simulation)"        = "#2166ac",
-               "IPW estimate (from tested)" = "#d6604d")
+      values = wes_palette("FantasticFox1"),
   ) +
   labs(
     title  = "Within-group prediabetes prevalence: true (simulation) vs IPW estimate",
